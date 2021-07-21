@@ -111,43 +111,45 @@ def _postprocess_yolo(trt_outputs, img_w, img_h, conf_th, nms_threshold,
     # Returns
         boxes, scores, classes (after NMS)
     """
-    # filter low-conf detections and concatenate results of all yolo layers
-    detections = []
-    for o in trt_outputs:
-        dets = o.reshape((-1, 7))
-        dets = dets[dets[:, 4] * dets[:, 6] >= conf_th]
-        detections.append(dets)
-    detections = np.concatenate(detections, axis=0)
+    # concatenate outputs of all yolo layers
+    detections = np.concatenate(
+        [o.reshape(-1, 7) for o in trt_outputs], axis=0)
 
-    if len(detections) == 0:
+    # drop detections with score lower than conf_th
+    box_scores = detections[:, 4] * detections[:, 6]
+    pos = np.where(box_scores >= conf_th)
+    detections = detections[pos]
+
+    # scale x, y, w, h from [0, 1] to pixel values
+    old_h, old_w = img_h, img_w
+    offset_h, offset_w = 0, 0
+    if letter_box:
+        if (img_w / input_shape[1]) >= (img_h / input_shape[0]):
+            old_h = int(input_shape[0] * img_w / input_shape[1])
+            offset_h = (old_h - img_h) // 2
+        else:
+            old_w = int(input_shape[1] * img_h / input_shape[0])
+            offset_w = (old_w - img_w) // 2
+
+    detections[:, 0] *= old_w
+    detections[:, 1] *= old_h
+    detections[:, 2] *= old_w
+    detections[:, 3] *= old_h
+
+    # NMS
+    nms_detections = np.zeros((0, 7), dtype=detections.dtype)
+    for class_id in set(detections[:, 5]):
+        idxs = np.where(detections[:, 5] == class_id)
+        cls_detections = detections[idxs]
+        keep = _nms_boxes(cls_detections, nms_threshold)
+        nms_detections = np.concatenate(
+            [nms_detections, cls_detections[keep]], axis=0)
+
+    if len(nms_detections) == 0:
         boxes = np.zeros((0, 4), dtype=np.int)
-        scores = np.zeros((0,), dtype=np.float32)
-        classes = np.zeros((0,), dtype=np.float32)
+        scores = np.zeros((0, 1), dtype=np.float32)
+        classes = np.zeros((0, 1), dtype=np.float32)
     else:
-        box_scores = detections[:, 4] * detections[:, 6]
-
-        # scale x, y, w, h from [0, 1] to pixel values
-        old_h, old_w = img_h, img_w
-        offset_h, offset_w = 0, 0
-        if letter_box:
-            if (img_w / input_shape[1]) >= (img_h / input_shape[0]):
-                old_h = int(input_shape[0] * img_w / input_shape[1])
-                offset_h = (old_h - img_h) // 2
-            else:
-                old_w = int(input_shape[1] * img_h / input_shape[0])
-                offset_w = (old_w - img_w) // 2
-        detections[:, 0:4] *= np.array(
-            [old_w, old_h, old_w, old_h], dtype=np.float32)
-
-        # NMS
-        nms_detections = np.zeros((0, 7), dtype=detections.dtype)
-        for class_id in set(detections[:, 5]):
-            idxs = np.where(detections[:, 5] == class_id)
-            cls_detections = detections[idxs]
-            keep = _nms_boxes(cls_detections, nms_threshold)
-            nms_detections = np.concatenate(
-                [nms_detections, cls_detections[keep]], axis=0)
-
         xx = nms_detections[:, 0].reshape(-1, 1)
         yy = nms_detections[:, 1].reshape(-1, 1)
         if letter_box:
@@ -175,17 +177,13 @@ class HostDeviceMem(object):
         return self.__str__()
 
 
-def get_input_shape(engine):
-    """Get input shape of the TensorRT YOLO engine."""
-    binding = engine[0]
-    assert engine.binding_is_input(binding)
-    binding_dims = engine.get_binding_shape(binding)
-    if len(binding_dims) == 4:
-        return tuple(binding_dims[2:])
-    elif len(binding_dims) == 3:
-        return tuple(binding_dims[1:])
-    else:
-        raise ValueError('bad dims of binding %s: %s' % (binding, str(binding_dims)))
+def binding_shape_to_volume(dims, batch_size=1):
+    """Calculate tensor volume based on its dims (shape).
+
+    Note dims[0] might be -1 for a dynamic batched engine, so we replace
+    that with batch_size.
+    """
+    return int(batch_size * np.product(np.array(dims[1:])))
 
 
 def allocate_buffers(engine):
@@ -193,19 +191,10 @@ def allocate_buffers(engine):
     inputs = []
     outputs = []
     bindings = []
-    output_idx = 0
     stream = cuda.Stream()
-    assert 3 <= len(engine) <= 5  # expect 1 input, plus 2~4 outpus
+    assert 3 <= len(engine) <= 4  # expect 1 input, plus 2 or 3 outpus
     for binding in engine:
-        binding_dims = engine.get_binding_shape(binding)
-        if len(binding_dims) == 4:
-            # explicit batch case (TensorRT 7+)
-            size = trt.volume(binding_dims)
-        elif len(binding_dims) == 3:
-            # implicit batch case (TensorRT 6 or older)
-            size = trt.volume(binding_dims) * engine.max_batch_size
-        else:
-            raise ValueError('bad dims of binding %s: %s' % (binding, str(binding_dims)))
+        size = binding_shape_to_volume(engine.get_binding_shape(binding))
         dtype = trt.nptype(engine.get_binding_dtype(binding))
         # Allocate host and device buffers
         host_mem = cuda.pagelocked_empty(size, dtype)
@@ -220,7 +209,6 @@ def allocate_buffers(engine):
             # output of 7 float32 values
             assert size % 7 == 0
             outputs.append(HostDeviceMem(host_mem, device_mem))
-            output_idx += 1
     return inputs, outputs, bindings, stream
 
 
@@ -263,6 +251,22 @@ def do_inference_v2(context, bindings, inputs, outputs, stream):
     return [out.host for out in outputs]
 
 
+def get_yolo_grid_sizes(model_name, h, w):
+    """Get grid sizes (w*h) for all yolo layers in the model."""
+    if 'yolov3' in model_name:
+        if 'tiny' in model_name:
+            return [(h // 32) * (w // 32), (h // 16) * (w // 16)]
+        else:
+            return [(h // 32) * (w // 32), (h // 16) * (w // 16), (h // 8) * (w // 8)]
+    elif 'yolov4' in model_name:
+        if 'tiny' in model_name:
+            return [(h // 32) * (w // 32), (h // 16) * (w // 16)]
+        else:
+            return [(h // 8) * (w // 8), (h // 16) * (w // 16), (h // 32) * (w // 32)]
+    else:
+        raise ValueError('ERROR: unknown model (%s)!' % args.model)
+
+
 class TrtYOLO(object):
     """TrtYOLO class encapsulates things needed to run TRT YOLO."""
 
@@ -271,9 +275,11 @@ class TrtYOLO(object):
         with open(TRTbin, 'rb') as f, trt.Runtime(self.trt_logger) as runtime:
             return runtime.deserialize_cuda_engine(f.read())
 
-    def __init__(self, model, category_num=80, letter_box=False, cuda_ctx=None):
+    def __init__(self, model, input_shape, category_num=80, letter_box=False,
+                 cuda_ctx=None):
         """Initialize TensorRT plugins, engine and conetxt."""
         self.model = model
+        self.input_shape = input_shape
         self.category_num = category_num
         self.letter_box = letter_box
         self.cuda_ctx = cuda_ctx
@@ -285,10 +291,11 @@ class TrtYOLO(object):
         self.trt_logger = trt.Logger(trt.Logger.INFO)
         self.engine = self._load_engine()
 
-        self.input_shape = get_input_shape(self.engine)
-
         try:
             self.context = self.engine.create_execution_context()
+            input_shape = self.context.get_binding_shape(0)
+            input_shape[0] = 1  # set batch_size to 1
+            assert self.context.set_binding_shape(0, input_shape)
             self.inputs, self.outputs, self.bindings, self.stream = \
                 allocate_buffers(self.engine)
         except Exception as e:

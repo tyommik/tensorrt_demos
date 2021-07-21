@@ -16,6 +16,7 @@ from utils.camera import add_camera_args, Camera
 from utils.display import show_fps
 from utils.visualization import BBoxVisualization
 from utils.mjpeg import MjpegServer
+
 from utils.yolo_with_plugins import TrtYOLO
 
 
@@ -29,10 +30,9 @@ def parse_args():
         help='number of object categories [80]')
     parser.add_argument(
         '-m', '--model', type=str, required=True,
-        help=('[yolov3-tiny|yolov3|yolov3-spp|yolov4-tiny|yolov4|'
-              'yolov4-csp|yolov4x-mish]-[{dimension}], where '
-              '{dimension} could be either a single number (e.g. '
-              '288, 416, 608) or 2 numbers, WxH (e.g. 416x256)'))
+        help=('[yolov3|yolov3-tiny|yolov3-spp|yolov4|yolov4-tiny]-'
+              '[{dimension}], where dimension could be a single '
+              'number (e.g. 288, 416, 608) or WxH (e.g. 416x256)'))
     parser.add_argument(
         '-l', '--letter_box', action='store_true',
         help='inference with letterboxed image [False]')
@@ -82,9 +82,20 @@ def main():
         raise SystemExit('ERROR: failed to open camera!')
 
     cls_dict = get_cls_dict(args.category_num)
-    vis = BBoxVisualization(cls_dict)
-    trt_yolo = TrtYOLO(args.model, args.category_num, args.letter_box)
+    yolo_dim = args.model.split('-')[-1]
+    if 'x' in yolo_dim:
+        dim_split = yolo_dim.split('x')
+        if len(dim_split) != 2:
+            raise SystemExit('ERROR: bad yolo_dim (%s)!' % yolo_dim)
+        w, h = int(dim_split[0]), int(dim_split[1])
+    else:
+        h = w = int(yolo_dim)
+    if h % 32 != 0 or w % 32 != 0:
+        raise SystemExit('ERROR: bad yolo_dim (%s)!' % yolo_dim)
 
+    trt_yolo = TrtYOLO(args.model, (h, w), args.category_num, args.letter_box)
+
+    vis = BBoxVisualization(cls_dict)
     mjpeg_server = MjpegServer(port=args.mjpeg_port)
     print('MJPEG server started...')
     try:
